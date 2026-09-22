@@ -129,7 +129,26 @@ export const CHATGPT_COMPLETION_SETTLE_MS = 2_000;
 export const CHATGPT_TOOL_CONFIRMATION_TIMEOUT_MS = 60_000;
 export const MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS = 3;
 const CHATGPT_CONNECTOR_MENTION_QUERY = "@codex";
-const CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS = 10_000;
+
+function configurableTimeoutMs(name: string, fallbackMs: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallbackMs;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    console.warn(`[chatgpt-web] ignoring invalid ${name}=${JSON.stringify(raw)}; using ${fallbackMs}ms`);
+    return fallbackMs;
+  }
+  return Math.floor(parsed);
+}
+
+const CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS = configurableTimeoutMs(
+  "CODEX_CHATGPT_WEB_CONNECTOR_ACTION_TIMEOUT_MS",
+  10_000,
+);
+const CHATGPT_OPERATIONAL_VIEWPORT_TIMEOUT_MS = configurableTimeoutMs(
+  "CODEX_CHATGPT_WEB_VIEWPORT_TIMEOUT_MS",
+  10_000,
+);
 const CHATGPT_SMOKE_TEXT = "Reply with exactly: CODEX WEB GPT READY";
 const CHATGPT_SMOKE_EXPECTED = "CODEX WEB GPT READY";
 /**
@@ -1093,12 +1112,12 @@ export function resolveChatGptWebMultipartStagingMode(
 }
 
 export const browserStageTimeouts = {
-  browserPage: 60_000,
-  temporaryChatPreparation: 150_000,
-  effortSelection: 120_000,
-  promptAttachment: 60_000,
-  fileAttachment: 120_000,
-  send: 20_000,
+  browserPage: configurableTimeoutMs("CODEX_CHATGPT_WEB_BROWSER_PAGE_TIMEOUT_MS", 60_000),
+  temporaryChatPreparation: configurableTimeoutMs("CODEX_CHATGPT_WEB_TEMPORARY_CHAT_TIMEOUT_MS", 150_000),
+  effortSelection: configurableTimeoutMs("CODEX_CHATGPT_WEB_EFFORT_SELECTION_TIMEOUT_MS", 120_000),
+  promptAttachment: configurableTimeoutMs("CODEX_CHATGPT_WEB_PROMPT_ATTACHMENT_TIMEOUT_MS", 60_000),
+  fileAttachment: configurableTimeoutMs("CODEX_CHATGPT_WEB_FILE_ATTACHMENT_TIMEOUT_MS", 120_000),
+  send: configurableTimeoutMs("CODEX_CHATGPT_WEB_SEND_TIMEOUT_MS", 20_000),
   // A Bigger Context stage posts a much larger payload onto a conversation that already holds the
   // earlier parts. This budget covers ChatGPT accepting the submission, not just the click.
   multipartStageSend: 180_000,
@@ -1201,7 +1220,7 @@ async function waitForOperationalChatGptViewport(page: Page, signal?: AbortSigna
     await withBrowserTurnAbort(page.waitForFunction(
       ({ width, height }) => innerWidth >= width && innerHeight >= height,
       CHATGPT_MIN_OPERATIONAL_VIEWPORT,
-      { polling: 50, timeout: 10_000 },
+      { polling: 50, timeout: CHATGPT_OPERATIONAL_VIEWPORT_TIMEOUT_MS },
     ), signal);
   } catch (error) {
     if (signal?.aborted) throw new DOMException("ChatGPT browser page acquisition aborted", "AbortError");

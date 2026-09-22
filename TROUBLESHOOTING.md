@@ -89,6 +89,26 @@ mean that the ChatGPT UI did not expose a structure the bridge can safely prove.
 Free and Go accounts normally expose Luna and Think without the paid-account effort selector. A
 missing paid selector on those accounts is not itself a sign-in failure.
 
+### Browser timeout tuning
+
+The launcher keeps the upstream defaults unless one of the following environment variables is set.
+These knobs only change browser wait budgets; they do not change the MCP connector, Tunnel, Codex
+route, or approval policy.
+
+```text
+CODEX_CHATGPT_WEB_VIEWPORT_TIMEOUT_MS=30000
+CODEX_CHATGPT_WEB_CONNECTOR_ACTION_TIMEOUT_MS=30000
+CODEX_CHATGPT_WEB_SEND_TIMEOUT_MS=60000
+CODEX_CHATGPT_WEB_BROWSER_PAGE_TIMEOUT_MS=90000
+CODEX_CHATGPT_WEB_TEMPORARY_CHAT_TIMEOUT_MS=240000
+CODEX_CHATGPT_WEB_EFFORT_SELECTION_TIMEOUT_MS=180000
+CODEX_CHATGPT_WEB_PROMPT_ATTACHMENT_TIMEOUT_MS=90000
+CODEX_CHATGPT_WEB_FILE_ATTACHMENT_TIMEOUT_MS=180000
+```
+
+All values are positive milliseconds. Invalid or unset values fall back to the upstream defaults.
+Restart the launcher after changing the environment so its browser helper inherits the new values.
+
 ## Full harness or MCP verification fails
 
 Video walkthroughs:
