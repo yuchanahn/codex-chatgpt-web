@@ -8,6 +8,23 @@ import {
   type CompactionTransactionHandle,
 } from "./compaction-transaction";
 import type { ChatGptTurnEnvironment } from "./environment";
+import { chatGptToolTimeoutError } from "./adapter-error";
+import { subagentModelObservation } from "./mcp-observation";
+
+interface BrokerRetirementFailure {
+  code: "codex_tool_timeout";
+  tool: string;
+  timeoutMs: number;
+}
+
+function assertRetirementFailure(value: unknown): asserts value is BrokerRetirementFailure {
+  const failure = value as Partial<BrokerRetirementFailure> | null;
+  if (!failure || failure.code !== "codex_tool_timeout"
+    || typeof failure.tool !== "string" || !/^[A-Za-z0-9_.-]{1,256}$/.test(failure.tool)
+    || !Number.isSafeInteger(failure.timeoutMs) || failure.timeoutMs! <= 0) {
+    throw new Error("Invalid Codex tool retirement failure");
+  }
+}
 
 interface PendingTurn extends ChatGptTurnEnvironment {
   expiresAt?: number;
@@ -82,7 +99,7 @@ interface TurnChannel {
   activityRevision: number;
   completionCommitted: boolean;
   completionRevision?: number;
-  retirementWaiters: Set<SafeWaiter<void>>;
+  retirementWaiters: Set<SafeWaiter<BrokerRetirementFailure | undefined>>;
   batchTimer?: ReturnType<typeof setTimeout>;
 }
 
@@ -130,6 +147,7 @@ interface BrokerRequest {
   surfaceNonce?: string;
   finalAnswer?: string;
   contract?: "native" | "safe";
+  failure?: BrokerRetirementFailure;
 }
 
 interface BrokerResponse {
@@ -227,7 +245,7 @@ export interface TurnBrokerOwner {
   compactionDeliveryCount(token: string): number | Promise<number>;
   beginCompletionFence(token: string): number | undefined | Promise<number | undefined>;
   commitCompletionFence(token: string, revision: number): boolean | Promise<boolean>;
-  waitForRetirement(token: string, signal?: AbortSignal): Promise<void>;
+  waitForRetirement(token: string, signal?: AbortSignal): Promise<BrokerRetirementFailure | undefined>;
   revoke(token: string, reason?: Error): void | Promise<void>;
 }
 
@@ -260,6 +278,7 @@ export class TurnBroker implements TurnBrokerOwner {
   private acceptingExternalOwners = true;
   private server?: Server;
   private startPromise?: Promise<void>;
+  private socketIdentity?: { dev: number; ino: number };
 
   private constructor(readonly socketPath: string) {}
 
@@ -467,10 +486,10 @@ export class TurnBroker implements TurnBrokerOwner {
     return true;
   }
 
-  waitForRetirement(token: string, signal?: AbortSignal): Promise<void> {
+  waitForRetirement(token: string, signal?: AbortSignal): Promise<BrokerRetirementFailure | undefined> {
     this.prune();
     const channel = this.channels.get(token);
-    if (!channel) return Promise.resolve();
+    if (!channel) return Promise.resolve(undefined);
     return this.waitForSafeState(channel.retirementWaiters, signal, "turn retirement wait aborted");
   }
 
@@ -609,9 +628,18 @@ export class TurnBroker implements TurnBrokerOwner {
     return this.waitForSafeState(safe.completionWaiters, signal, "Zero Risk turn completion wait aborted");
   }
 
-  revoke(token: string, reason = new Error("Codex turn binding was revoked")): void {
+  revoke(token: string, reason = new Error("Codex turn binding was revoked"), failure?: BrokerRetirementFailure): void {
     const channel = this.channels.get(token);
     if (!channel) return;
+    console.info(`[chatgpt-web] broker_retired ${JSON.stringify({
+      traceId: channel.traceId,
+      pendingTools: channel.invocations.size,
+      queuedTools: channel.queuedCallIds.length,
+      deliveredTools: channel.deliveredCallIds.size,
+      activeMcpRequests: channel.activities.size,
+      completionCommitted: channel.completionCommitted,
+      ...(failure ? { failure } : {}),
+    })}`);
     this.channels.delete(token);
     this.pending.delete(token);
     if (channel.bindingId) {
@@ -625,7 +653,7 @@ export class TurnBroker implements TurnBrokerOwner {
       this.rejectSafeWaiters(channel.safe.completionWaiters, reason);
     }
     this.retire(this.retiredTokens, token, channel.traceId);
-    this.resolveSafeWaiters(channel.retirementWaiters, undefined);
+    this.resolveSafeWaiters(channel.retirementWaiters, failure);
     this.rejectChannel(channel, reason);
   }
 
@@ -731,16 +759,21 @@ export class TurnBroker implements TurnBrokerOwner {
     const server = this.server;
     this.server = undefined;
     this.startPromise = undefined;
-    brokers.delete(this.socketPath);
+    if (brokers.get(this.socketPath) === this) brokers.delete(this.socketPath);
     if (server?.listening) {
       await new Promise<void>((resolveClose, rejectClose) => server.close(error => {
         if (!error || (error as NodeJS.ErrnoException).code === "ERR_SERVER_NOT_RUNNING") resolveClose();
         else rejectClose(error);
       }));
     }
-    if (!isWindowsPipeEndpoint(this.socketPath)
-      && existsSync(this.socketPath)
-      && lstatSync(this.socketPath).isSocket()) unlinkSync(this.socketPath);
+    const identity = this.socketIdentity;
+    this.socketIdentity = undefined;
+    if (identity && existsSync(this.socketPath)) {
+      const current = lstatSync(this.socketPath);
+      if (current.isSocket() && current.dev === identity.dev && current.ino === identity.ino) {
+        unlinkSync(this.socketPath);
+      }
+    }
   }
 
   private start(): Promise<void> {
@@ -772,7 +805,11 @@ export class TurnBroker implements TurnBrokerOwner {
         });
         server.listen(this.socketPath, () => {
           server.off("error", rejectStart);
-          if (!windowsPipe) chmodSync(this.socketPath, 0o600);
+          if (!windowsPipe) {
+            const { dev, ino } = lstatSync(this.socketPath);
+            this.socketIdentity = { dev, ino };
+            chmodSync(this.socketPath, 0o600);
+          }
           resolveStart();
         });
       };
@@ -979,7 +1016,9 @@ export class TurnBroker implements TurnBrokerOwner {
     }
     if (request.method === "owner_wait_retirement") {
       if (!request.token) throw new Error("turn owner token is required");
-      return this.waitForRetirement(request.token, socketSignal).then(() => ({ retired: true }));
+      return this.waitForRetirement(request.token, socketSignal).then(failure => ({
+        retired: true, ...(failure ? { failure } : {}),
+      }));
     }
     if (request.method === "owner_revoke") {
       if (!request.token) throw new Error("turn owner token is required");
@@ -1104,7 +1143,12 @@ export class TurnBroker implements TurnBrokerOwner {
         : "internal Codex turn binding is invalid or expired");
     }
     if (request.method === "release") {
-      this.revoke(binding.token);
+      if (request.failure !== undefined) {
+        assertRetirementFailure(request.failure);
+        this.revoke(binding.token, chatGptToolTimeoutError(request.failure.tool, request.failure.timeoutMs), request.failure);
+      } else {
+        this.revoke(binding.token);
+      }
       return { released: true };
     }
     if (request.method === "resolve") return { environment: binding.channel.environment };
@@ -1134,6 +1178,10 @@ export class TurnBroker implements TurnBrokerOwner {
       console.info(
         `[chatgpt-web] broker trace=${binding.channel.traceId} queued call=${callId.slice(0, 17)} tool=${wireName} waiters=${binding.channel.waiters.size}`,
       );
+      const modelObservation = !toolRequest.freeform && subagentModelObservation(wireName, toolRequest.arguments);
+      if (modelObservation) console.info(`[chatgpt-web] subagent_model_requested ${JSON.stringify({
+        traceId: binding.channel.traceId, callId: callId.slice(0, 17), tool: wireName, ...modelObservation,
+      })}`);
       this.scheduleToolWaiters(binding.channel);
     });
   }
@@ -1267,8 +1315,8 @@ export async function callTurnBroker<T>(
     }
     socket.setEncoding("utf8");
     socket.once("error", error => finishError(new Error(`ChatGPT web turn broker unavailable: ${error.message}`)));
-    // The server owns response termination. Waiting for the pipe/socket to close before resolving
-    // prevents callers from retiring the broker while Bun still has a named-pipe write in flight.
+    // The server owns response termination. Bounded calls wait for the pipe/socket to close
+    // before their callers can advance the lifecycle while Bun drains named-pipe writes.
     socket.once("close", finishResponse);
     socket.once("connect", () => socket.write(`${JSON.stringify({ id, ...wireRequest })}\n`));
     socket.on("data", chunk => {
@@ -1287,14 +1335,19 @@ export async function callTurnBroker<T>(
         finishError(new Error(`ChatGPT web turn broker returned invalid JSON: ${errorOf(error).message}`));
         return;
       }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)
+        || ("result" in parsed) === ("error" in parsed)
+        || ("error" in parsed && (typeof parsed.error !== "string" || !parsed.error))) {
+        finishError(new Error("ChatGPT web turn broker returned an invalid response frame"));
+        return;
+      }
       if (parsed.id !== id) {
         finishError(new Error("ChatGPT web turn broker response id mismatch"));
         return;
       }
       response = parsed;
       if (settleOnResponseFrame) {
-        // A long-poll keeps its request half open while the server waits. Its complete response
-        // frame is therefore the terminal boundary; ordinary calls still wait for physical close.
+        // Long-polls finish on the full frame; their peer can otherwise keep both halves open.
         finishResponse();
         socket.destroy();
       }
@@ -1478,14 +1531,16 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     return response.committed;
   }
 
-  async waitForRetirement(token: string, signal?: AbortSignal): Promise<void> {
-    const response = await callTurnBroker<{ retired?: unknown }>(
+  async waitForRetirement(token: string, signal?: AbortSignal): Promise<BrokerRetirementFailure | undefined> {
+    const response = await callTurnBroker<{ retired?: unknown; failure?: unknown }>(
       this.socketPath,
       { method: "owner_wait_retirement", token },
       null,
       signal,
     );
     if (response.retired !== true) throw new Error("DEV turn owner received an invalid retirement result");
+    if (response.failure !== undefined) assertRetirementFailure(response.failure);
+    return response.failure;
   }
 
   async revoke(token: string, _reason?: Error): Promise<void> {

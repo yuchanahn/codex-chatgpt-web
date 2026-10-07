@@ -16,6 +16,30 @@ test("DEV harness configuration cannot bind a Responses listener", () => {
   expect(() => startServer(config)).toThrow("cannot start a Responses listener");
 });
 
+test("saved Luna Bigger Context configuration returns an actionable error before a turn starts", async () => {
+  for (const mode of ["browser-only", "full"] as const) for (const stream of [false, true]) {
+    for (const model of ["chatgpt-web/gpt-5.6-luna", "chatgpt-web/luna", "chatgpt-web/think"]) {
+      const config = { ...defaultConfig(mode), solAvailable: false, experimentalBiggerContext: true };
+      let adapterStarted = false;
+      const response = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model, input: "hello", stream }),
+      }), config, () => {
+        adapterStarted = true;
+        throw new Error("Unsupported configuration must not start an adapter");
+      });
+      expect(response.status).toBe(400);
+      expect(response.headers.get("content-type")).toContain("application/json");
+      const body = await response.json() as { error: { type: string; message: string } };
+      expect(body.error.type).toBe("invalid_request_error");
+      expect(body.error.message).toContain("unavailable for Luna and Think");
+      expect(body.error.message).toContain("Turn it off in launcher Settings");
+      expect(adapterStarted).toBeFalse();
+    }
+  }
+});
+
 async function waitForTurnCount(turns: HttpTurnCounter, expected: number): Promise<void> {
   const deadline = Date.now() + 1_000;
   while (turns.count() !== expected && Date.now() < deadline) await Bun.sleep(5);
@@ -723,10 +747,12 @@ test(`targeted cancellation preserves peer turns and its cause: ${reason ?? "use
   let targetCancelled = 0;
   let otherCancelled = 0;
   const targetBrowser = new Promise<string>((_resolve, reject) => { rejectTarget = reject; });
+  let releaseHelper!: () => void;
+  const helperCleanup = new Promise<void>(resolve => { releaseHelper = resolve; });
   const target = chatGptTurnSessions.getOrCreate("target-key", () => ({
     mode: "read-only",
     browser: targetBrowser,
-    physicalSettlement: targetBrowser.then(() => undefined, () => undefined),
+    physicalSettlement: reason ? targetBrowser.then(() => undefined, () => undefined) : helperCleanup,
     trace: new ChatGptTraceFeed(),
     text: new ChatGptTextFeed(),
     cancel: reason => {
@@ -753,6 +779,7 @@ test(`targeted cancellation preserves peer turns and its cause: ${reason ?? "use
 
     const response = await fetch(`http://127.0.0.1:${server.port}/admin/cancel-turn`, {
       method: "POST",
+      signal: AbortSignal.timeout(1_000),
       headers: {
         "content-type": "application/json",
         authorization: `Bearer ${config.controlToken}`,
@@ -765,7 +792,8 @@ test(`targeted cancellation preserves peer turns and its cause: ${reason ?? "use
       trace_id: "trace_target",
       cancelled_browser_turns: 1,
       cancelled_broker_turns: 0,
-      active_browser_turns: 1,
+      // The receipt acknowledges cancellation before the browser's promise microtasks settle.
+      active_browser_turns: reason ? 1 : 2,
     });
     expect(targetCancelled).toBe(1);
     expect(otherCancelled).toBe(0);
@@ -774,6 +802,7 @@ test(`targeted cancellation preserves peer turns and its cause: ${reason ?? "use
       throw new Error("cancelled trace must remain terminal");
     }, "trace_target")).toBe(target);
   } finally {
+    releaseHelper();
     chatGptTurnSessions.clear();
     await server.stop(true);
   }

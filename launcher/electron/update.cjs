@@ -1,6 +1,5 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const https = require("node:https");
 const os = require("node:os");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
@@ -48,8 +47,8 @@ function releaseAssetName(version, platform = process.platform, arch = process.a
   if (platform === "win32" && arch === "x64") {
     return `codex-web-gpt-${version}-win-x64.exe`;
   }
-  if (platform === "linux" && arch === "x64") {
-    return `codex-web-gpt-${version}-linux-x64.AppImage`;
+  if (platform === "linux" && ["x64", "arm64"].includes(arch)) {
+    return `codex-web-gpt-${version}-linux-${arch}.AppImage`;
   }
   return null;
 }
@@ -71,56 +70,70 @@ function validateReleaseAssetUrl(raw, version, assetName) {
   return url.toString();
 }
 
-function request(url, redirects = 0) {
-  return new Promise((resolve, reject) => {
-    if (redirects > MAX_REDIRECTS) {
-      reject(new Error(`Too many redirects while downloading ${url}`));
-      return;
-    }
-    const parsed = new URL(url);
-    if (parsed.protocol !== "https:") {
-      reject(new Error(`Refusing non-HTTPS update URL: ${parsed.protocol}`));
-      return;
-    }
-    const req = https.get(parsed, {
-      headers: {
-        Accept: "application/vnd.github+json",
-        "User-Agent": USER_AGENT,
-      },
-    }, (response) => {
-      if ([301, 302, 303, 307, 308].includes(response.statusCode) && response.headers.location) {
-        response.resume();
-        const next = new URL(response.headers.location, parsed).toString();
-        request(next, redirects + 1).then(resolve, reject);
+function createUpdateDownloader(fetch, idleTimeoutMs = 60_000) {
+  async function* chunks(url) {
+    const controller = new AbortController();
+    let timer;
+    const armTimeout = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => controller.abort(new Error("Update request timed out")), idleTimeoutMs);
+      timer.unref?.();
+    };
+    armTimeout();
+    try {
+      for (let redirects = 0; ; redirects += 1) {
+        if (redirects > MAX_REDIRECTS) throw new Error("Too many redirects while downloading update");
+        const parsed = new URL(url);
+        if (parsed.protocol !== "https:" || parsed.username || parsed.password) {
+          throw new Error("Refusing non-HTTPS or credential-bearing update URL");
+        }
+        const response = await fetch(parsed.toString(), {
+          headers: { Accept: "application/vnd.github+json", "User-Agent": USER_AGENT },
+          credentials: "omit",
+          cache: "no-store",
+          redirect: "manual",
+          signal: controller.signal,
+        });
+        const location = response.headers.get("location");
+        if ([301, 302, 303, 307, 308].includes(response.status) && location) {
+          await response.body?.cancel();
+          url = new URL(location, parsed).toString();
+          armTimeout();
+          continue;
+        }
+        if (response.status !== 200) {
+          await response.body?.cancel();
+          throw new Error(`Update download failed with HTTP ${response.status}`);
+        }
+        if (!response.body) throw new Error("Update download returned no body");
+        armTimeout();
+        for await (const chunk of response.body) {
+          armTimeout();
+          yield chunk;
+        }
         return;
       }
-      if (response.statusCode !== 200) {
-        response.resume();
-        reject(new Error(`Update download failed with HTTP ${response.statusCode}`));
-        return;
-      }
-      resolve(response);
-    });
-    req.setTimeout(60_000, () => req.destroy(new Error("Update request timed out")));
-    req.once("error", reject);
-  });
-}
-
-async function downloadText(url, maxBytes = 2 * 1024 * 1024) {
-  const response = await request(url);
-  const chunks = [];
-  let bytes = 0;
-  for await (const chunk of response) {
-    bytes += chunk.length;
-    if (bytes > maxBytes) throw new Error("Update metadata exceeded its size limit");
-    chunks.push(chunk);
+    } finally {
+      clearTimeout(timer);
+      controller.abort();
+    }
   }
-  return Buffer.concat(chunks).toString("utf8");
-}
 
-async function downloadFile(url, destination) {
-  const response = await request(url);
-  await pipeline(response, fs.createWriteStream(destination, { flags: "wx", mode: 0o600 }));
+  return {
+    async downloadText(url, maxBytes = 2 * 1024 * 1024) {
+      const parts = [];
+      let bytes = 0;
+      for await (const chunk of chunks(url)) {
+        bytes += chunk.length;
+        if (bytes > maxBytes) throw new Error("Update metadata exceeded its size limit");
+        parts.push(chunk);
+      }
+      return Buffer.concat(parts).toString("utf8");
+    },
+    async downloadFile(url, destination) {
+      await pipeline(chunks(url), fs.createWriteStream(destination, { flags: "wx", mode: 0o600 }));
+    },
+  };
 }
 
 function sha256(filePath) {
@@ -157,6 +170,20 @@ function findMacApplication(root) {
   return application;
 }
 
+function linuxUpdateInstallation() {
+  const guidance = "Quit Codex Web GPT, run install-launcher.sh from the README once, then reopen the installed app. Your settings and browser profile are preserved.";
+  const target = process.env.CODEX_WEB_GPT_APPIMAGE?.trim()
+    || process.env.APPIMAGE?.trim();
+  if (!target || !path.isAbsolute(target)) {
+    throw new Error(`The running Linux AppImage path is unavailable. ${guidance}`);
+  }
+  const wrapper = process.env.CODEX_WEB_GPT_LAUNCHER_EXECUTABLE?.trim();
+  if (!wrapper || !path.isAbsolute(wrapper)) {
+    throw new Error(`Linux auto-update requires the stable install-launcher.sh wrapper. ${guidance}`);
+  }
+  return { target, wrapper };
+}
+
 function buildJob({ version, platform, executablePath, assetPath, stagingRoot, tempRoot, logPath }) {
   if (platform === "darwin") {
     return {
@@ -181,15 +208,7 @@ function buildJob({ version, platform, executablePath, assetPath, stagingRoot, t
     };
   }
   if (platform === "linux") {
-    const target = process.env.CODEX_WEB_GPT_APPIMAGE?.trim()
-      || process.env.APPIMAGE?.trim();
-    if (!target || !path.isAbsolute(target)) {
-      throw new Error("The running Linux AppImage path is unavailable; reinstall with install-launcher.sh");
-    }
-    const wrapper = process.env.CODEX_WEB_GPT_LAUNCHER_EXECUTABLE?.trim();
-    if (!wrapper || !path.isAbsolute(wrapper)) {
-      throw new Error("Linux auto-update requires the stable install-launcher.sh wrapper; reinstall once");
-    }
+    const { target, wrapper } = linuxUpdateInstallation();
     return {
       version,
       platform,
@@ -206,6 +225,11 @@ function buildJob({ version, platform, executablePath, assetPath, stagingRoot, t
 }
 
 function defaultDependencies() {
+  // Chromium owns the launcher's system proxy/PAC policy. Do not bypass it with
+  // Node HTTPS or borrow cookies from the authenticated ChatGPT browser profile.
+  const { downloadText, downloadFile } = createUpdateDownloader(
+    (url, options) => require("electron").net.fetch(url, options),
+  );
   return {
     fetchRelease: async () => JSON.parse(await downloadText(RELEASE_API_URL)),
     downloadText,
@@ -275,6 +299,11 @@ function createUpdateController({
     transition({ status: "checking" });
     try {
       const release = await deps.fetchRelease();
+      // GitHub's /releases/latest already excludes these, including for older launchers.
+      if (release?.draft === true || release?.prerelease === true) {
+        candidate = null;
+        return transition({ status: "up-to-date" });
+      }
       const version = releaseVersion(release?.tag_name);
       if (compareVersions(version, currentVersion) <= 0) {
         candidate = null;
@@ -306,6 +335,7 @@ function createUpdateController({
   async function beginInstall() {
     if (pending) throw new Error("An update is already being prepared");
     if (state.status !== "available" || !candidate) throw new Error("No launcher update is available");
+    if (platform === "linux") linuxUpdateInstallation();
     const available = candidate;
     pending = (async () => {
       transition({ status: "downloading", version: available.version });
@@ -377,6 +407,7 @@ module.exports = {
   buildJob,
   compareVersions,
   createUpdateController,
+  createUpdateDownloader,
   expectedChecksum,
   macApplicationPath,
   parseVersion,

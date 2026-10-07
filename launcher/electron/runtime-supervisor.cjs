@@ -11,6 +11,7 @@ const {
   terminateOwnedProcessTree,
 } = require("./process-tree.cjs");
 const { runtimeInvocation } = require("./runtime-command.cjs");
+const { windowsTrustEnvironment } = require("./windows-trust.cjs");
 
 const RESTART_WINDOW_MS = 60_000;
 const MAX_RESTARTS_PER_WINDOW = 5;
@@ -261,6 +262,10 @@ function validateConfig(config, descriptorPath, platform = process.platform, lau
     && typeof config.experimentalBiggerContext !== "boolean") {
     throw new Error("Runtime configuration has an invalid experimentalBiggerContext");
   }
+  if (config.experimentalFreshConversationPerTurn !== undefined
+    && typeof config.experimentalFreshConversationPerTurn !== "boolean") {
+    throw new Error("Runtime configuration has an invalid experimentalFreshConversationPerTurn");
+  }
   if (config.stallTimeoutSec !== undefined
     && (!Number.isFinite(config.stallTimeoutSec) || config.stallTimeoutSec <= 0)) {
     throw new Error("Runtime configuration has an invalid stallTimeoutSec");
@@ -329,6 +334,7 @@ class RuntimeSupervisor {
     launcherProfile = "production",
     publishOperation,
     runtimeInvocationFactory = runtimeInvocation,
+    onConfigRead,
   }) {
     this.app = app;
     this.logger = logger;
@@ -343,6 +349,7 @@ class RuntimeSupervisor {
     this.launcherProfile = launcherProfile;
     this.publishOperation = publishOperation;
     this.runtimeInvocationFactory = runtimeInvocationFactory;
+    this.onConfigRead = onConfigRead;
     this.configPath = path.join(coreHome, "config.json");
     this.statePath = path.join(coreHome, "runtime", "launcher-supervisor.json");
     this.daemon = null;
@@ -367,12 +374,14 @@ class RuntimeSupervisor {
 
   readConfig() {
     if (!fs.existsSync(this.configPath)) return null;
-    return validateConfig(
+    const config = validateConfig(
       readJson(this.configPath),
       this.browserDescriptorPath,
       this.platform,
       this.launcherProfile,
     );
+    this.onConfigRead?.(config);
+    return config;
   }
 
   readSetupConfig() {
@@ -487,10 +496,10 @@ class RuntimeSupervisor {
     const child = spawn(invocation.executable, invocation.args, {
       cwd: invocation.cwd,
       detached: DETACH_OWNED_CHILD,
-      env: {
+      env: windowsTrustEnvironment({
         ...process.env,
         CODEX_CHATGPT_WEB_BROWSER_HOST_DESCRIPTOR: this.browserDescriptorPath,
-      },
+      }, this.platform),
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });

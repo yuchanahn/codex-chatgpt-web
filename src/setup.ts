@@ -41,8 +41,10 @@ import {
 import { connectTunnel, createTunnelConfig, installRuntimeKey, installRuntimeKeyBytes, installTunnelClient, managedRuntimeKeyPath, stopTunnel, waitForTunnelReady } from "./tunnel";
 import { getTunnelServiceStatus, installTunnelService, restartTunnelService, stopTunnelService, tunnelServiceDefinitionMatches, uninstallTunnelService } from "./tunnel-service";
 import { VERSION } from "./version";
+import { CHATGPT_WEB_LUNA_BIGGER_CONTEXT_ERROR } from "./chatgpt-web-models";
 
 export interface SetupOptions {
+  connectorNameSuffix?: string;
   mode: RuntimeMode;
   browserInteractionMode?: BrowserInteractionMode;
   subagentProtocol?: SubagentProtocol;
@@ -54,6 +56,8 @@ export interface SetupOptions {
   autoApproveToolCalls?: boolean;
   experimentalBiggerContext?: boolean;
   experimentalSkillAttachments?: boolean;
+  experimentalFreshConversationPerTurn?: boolean;
+  useSavedChats?: boolean;
   zeroRiskProEnabled?: boolean;
   replaceCodexRoute?: boolean;
   restartService?: boolean;
@@ -146,6 +150,8 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     proAvailable: before.proAvailable,
     experimentalBiggerContext: before.experimentalBiggerContext,
     experimentalSkillAttachments: before.experimentalSkillAttachments,
+    experimentalFreshConversationPerTurn: before.experimentalFreshConversationPerTurn,
+    useSavedChats: before.useSavedChats,
     zeroRiskProEnabled: before.zeroRiskProEnabled,
     autoApproveToolCalls: before.autoApproveToolCalls,
     controlToken: before.controlToken,
@@ -175,6 +181,8 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     proAvailable: after.proAvailable,
     experimentalBiggerContext: after.experimentalBiggerContext,
     experimentalSkillAttachments: after.experimentalSkillAttachments,
+    experimentalFreshConversationPerTurn: after.experimentalFreshConversationPerTurn,
+    useSavedChats: after.useSavedChats,
     zeroRiskProEnabled: after.zeroRiskProEnabled,
     autoApproveToolCalls: after.autoApproveToolCalls,
     controlToken: after.controlToken,
@@ -252,6 +260,8 @@ function baseConfig(
   Object.assign(config, resolveInteractionConnectorIdentities(
     config.browserInteractionMode,
     profile,
+    existing,
+    options.connectorNameSuffix,
   ));
   if (options.subagentProtocol) config.subagentProtocol = options.subagentProtocol;
   config.releaseVersion = VERSION;
@@ -273,6 +283,10 @@ function baseConfig(
   if (options.experimentalSkillAttachments !== undefined) {
     config.experimentalSkillAttachments = options.experimentalSkillAttachments;
   }
+  if (options.useSavedChats !== undefined) config.useSavedChats = options.useSavedChats;
+  if (options.experimentalFreshConversationPerTurn !== undefined) {
+    config.experimentalFreshConversationPerTurn = options.experimentalFreshConversationPerTurn;
+  }
   if (options.experimentalBiggerContext !== undefined) {
     config.experimentalBiggerContext = options.experimentalBiggerContext;
   }
@@ -283,6 +297,9 @@ function baseConfig(
     config.zeroRiskProEnabled = options.zeroRiskProEnabled;
   }
   if (config.browserInteractionMode === "manual") {
+    if (options.experimentalFreshConversationPerTurn === true) {
+      throw new Error("Fresh browser conversations per turn is available only in automatic mode");
+    }
     if (options.refreshAccountCapabilities) {
       throw new Error("Zero Risk cannot refresh account capabilities");
     }
@@ -554,6 +571,9 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   config.solAvailable = solAvailable === true;
   config.extraHighAvailable = config.solAvailable && extraHighAvailable === true;
   config.proAvailable = config.solAvailable && proAvailable === true;
+  if (config.experimentalBiggerContext && !config.solAvailable) {
+    throw new Error(CHATGPT_WEB_LUNA_BIGGER_CONTEXT_ERROR);
+  }
   const explicitTunnelChange = Boolean(options.tunnelId || options.runtimeKeyFile || options.runtimeKeyValue);
   const preliminaryChange = Boolean(existing && (meaningfulRuntimeChange(existing, config) || explicitTunnelChange || options.forceLogin));
   if (beforeService.loaded && preliminaryChange && !options.restartService) {
@@ -665,6 +685,10 @@ export async function setupDevProfile(options: SetupOptions): Promise<DevProfile
     config.solAvailable = capabilities.solAvailable;
     config.extraHighAvailable = capabilities.solAvailable && capabilities.extraHighAvailable;
     config.proAvailable = capabilities.solAvailable && capabilities.proAvailable;
+  }
+
+  if (config.experimentalBiggerContext && !config.solAvailable) {
+    throw new Error(CHATGPT_WEB_LUNA_BIGGER_CONTEXT_ERROR);
   }
 
   await configureTunnel(config, existing, options);

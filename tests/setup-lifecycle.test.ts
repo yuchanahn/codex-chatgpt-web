@@ -89,16 +89,87 @@ for (const development of [false, true]) for (const interaction of ["manual", "a
       const listener = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response() });
       const port = listener.port!;
       await listener.stop(true);
-      const result = await (development ? setupDevProfile : setup)({ ...options, port });
+      const result = await (development ? setupDevProfile : setup)({ ...options, port,
+        ...(interaction === "automatic" ? { experimentalFreshConversationPerTurn: true } : {}),
+        useSavedChats: true,
+        connectorNameSuffix: "Work",
+      });
       expect(calls).toEqual(development ? ["save"] : ["save", "integrate"]);
       expect(saved?.tunnel?.alias).toBe(`codex-chatgpt-web${development ? "-dev" : ""}${interaction === "manual" ? "-zero-risk" : ""}`);
       expect(result.tunnelReady).not.toBe(true);
       expect(result.connectorSetupRequired).toBe(true);
+      expect(saved?.experimentalFreshConversationPerTurn).toBe(interaction === "automatic");
+      expect(saved?.useSavedChats).toBe(true);
+      expect(saved?.appName).toBe("Codex Work");
+      expect(interaction === "manual" ? saved?.automaticAppName : saved?.manualAppName)
+        .toBe(interaction === "automatic" ? "Codex Zero Risk" : development ? "Codex Native2 DEV" : "Codex Native2");
+      // Unrelated setup and mode changes retain the suffix; clearing it is explicit.
+      const initial = structuredClone(saved!);
+      mocks.push(spyOn(configModule, "loadConfigForSetup").mockImplementation(() => structuredClone(initial)));
+      writeFileSync(join(root, "config.json"), JSON.stringify(initial));
+      await (development ? setupDevProfile : setup)({ ...options, port });
+      expect(saved?.appName).toBe(initial.appName);
+      await (development ? setupDevProfile : setup)({ ...options, port, connectorNameSuffix: interaction === "manual" ? "Zero Risk" : development ? "Native2 DEV" : "Native2" });
+      expect(saved?.appName).toBe(interaction === "manual" ? "Codex Zero Risk"
+        : development ? "Codex Native2 DEV" : "Codex Native2");
 
       calls.length = 0;
       mocks.push(spyOn(configModule, "saveConfig").mockImplementation(() => { throw new Error("config commit failed"); }));
       await expect((development ? setupDevProfile : setup)({ ...options, port })).rejects.toThrow("config commit failed");
       expect(calls).toEqual([]);
+    } finally {
+      for (const mock of mocks.reverse()) mock.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const development of [false, true]) {
+  test(`${development ? "DEV" : "production"} rejects Luna Bigger Context without changing config and accepts explicitly disabling it`, async () => {
+    const root = mkdtempSync(join(tmpdir(), "codex-web-luna-setup-"));
+    const configPath = join(root, "config.json");
+    const existing = {
+      ...configModule.defaultConfig("browser-only"),
+      browserHost: "launcher" as const,
+      solAvailable: false, extraHighAvailable: false, proAvailable: false,
+      experimentalBiggerContext: true,
+      ...(development ? { purpose: "dev-harness" as const } : {}),
+    };
+    writeFileSync(configPath, JSON.stringify(existing));
+    let scannedSolAvailable = false;
+    const save = spyOn(configModule, "saveConfig").mockImplementation(() => {});
+    const integrate = spyOn(integration, "installCodexIntegration").mockImplementation(() => ({} as never));
+    const mocks = [save, integrate,
+      spyOn(configModule, "getConfigPath").mockReturnValue(configPath),
+      spyOn(configModule, "loadConfigForSetup").mockImplementation(() => structuredClone(existing)),
+      spyOn(integration, "preflightCodexIntegration").mockImplementation(() => {}),
+      spyOn(service, "getServiceStatus").mockReturnValue({ installed: false, loaded: false } as never),
+      spyOn(service, "removeLegacyRuntimeArtifacts").mockImplementation(() => {}),
+      spyOn(browserHost, "inspectLauncherBrowserHost").mockImplementation(async () => ({
+        solAvailable: scannedSolAvailable, extraHighAvailable: false, proAvailable: false,
+      }) as never),
+    ];
+    try {
+      const listener = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response() });
+      const port = listener.port!;
+      await listener.stop(true);
+      const options = { mode: "browser-only" as const, subagentProtocol: "native" as const, port,
+        browserHostDescriptorPath: join(root, "launcher-browser.json"), acknowledgedUnofficial: true };
+      const configure = development ? setupDevProfile : setup;
+      await expect(configure(options)).rejects.toThrow("Turn it off in launcher Settings");
+      await expect(configure({ ...options, experimentalBiggerContext: true })).rejects.toThrow("unavailable for Luna and Think");
+      // Refreshing a previously paid account must validate the newly observed capability.
+      existing.solAvailable = true;
+      await expect(configure({ ...options, refreshAccountCapabilities: true })).rejects.toThrow("--standard-context");
+      expect(save).not.toHaveBeenCalled();
+      expect(integrate).not.toHaveBeenCalled();
+      existing.solAvailable = false;
+      await configure({ ...options, experimentalBiggerContext: false });
+      expect(save.mock.calls.at(-1)?.[0]).toMatchObject({ solAvailable: false, experimentalBiggerContext: false });
+      expect(existing.experimentalBiggerContext).toBeTrue();
+      scannedSolAvailable = true;
+      await configure({ ...options, refreshAccountCapabilities: true, experimentalBiggerContext: true });
+      expect(save.mock.calls.at(-1)?.[0]).toMatchObject({ solAvailable: true, experimentalBiggerContext: true });
     } finally {
       for (const mock of mocks.reverse()) mock.mockRestore();
       rmSync(root, { recursive: true, force: true });
